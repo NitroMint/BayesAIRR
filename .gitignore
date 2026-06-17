@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Model files (large - keep specific ones, ignore checkpoints)
+*.pt
+!model.pt
+
+# IDE
+.vscode/
+.idea/
