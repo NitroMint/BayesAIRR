@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-深度概率编程网络 — 基于 PyTorch 的贝叶斯连接区生成模型 (v2.0 升级架构)
+Bayesian junction generation network — PyTorch-based model for BCR N-region insertion (v2.0 upgraded architecture)
 
-升级要点:
-1. GeneEmbedding: 层级化 Family + Allele 两级嵌入，罕见基因安全回退
-2. FlankPhysChemEncoder: 6通道物理化学 CNN，侧翼相似性自动泛化
-3. BayesianJunctionNet: 3层扩张 MLP + N1/N2 独立双头，~800K 参数
-4. BNN KL 正则化: 罕见组合自动回退到无信息先验，而非过拟合
+Key upgrades:
+1. GeneEmbedding: Hierarchical Family + Allele two-level embedding, safe fallback for rare genes
+2. FlankPhysChemEncoder: 6-channel physicochemical CNN, automatic flank similarity generalization
+3. BayesianJunctionNet: 3-layer expanding MLP + independent N1/N2 heads, ~800K parameters
+4. BNN KL regularization: Rare combinations automatically fall back to uninformative prior instead of overfitting
 
-设计哲学 (免疫组库高多样性):
-- Embedding/CNN 是确定性的，不参与贝叶斯采样(降低训练难度)
-- 不确定性集中在 MLP 层——这是最优位置
-- sigma_thresh 通过 MLP 的权重扰动控制全链熵
-- 罕见组合: BNN 输出天然高方差 → "我不知道"比"我猜错了"安全
+Design philosophy (high-diversity immune repertoire):
+- Embedding/CNN are deterministic, not involved in Bayesian sampling (reduces training difficulty)
+- Uncertainty is concentrated in the MLP layers — the optimal location
+- sigma_thresh controls total chain entropy via weight perturbation in the MLP
+- Rare combinations: BNN output naturally high variance → "I don't know" is safer than "I guessed wrong"
 
-数学:
+Mathematics:
     W_layer = mu + softplus(rho) * sigma_thresh * epsilon, epsilon ~ N(0,I)
-    KL(q(W)||p(W)) 正则化自动将罕见组合拉回先验分布
+    KL(q(W)||p(W)) regularization automatically pulls rare combinations back to the prior distribution
 """
 
 from __future__ import annotations
@@ -40,23 +40,23 @@ def _set_torch_seed(seed: int, device: torch.device) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 贝叶斯变分线性层 (保持核心逻辑不变)
+# Bayesian variational linear layer (core logic unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 
 class BayesianLinear(nn.Module):
     """
-    贝叶斯变分线性层 — 每个权重是独立高斯分布 N(mu, softplus(rho)^2)。
+    Bayesian variational linear layer — each weight is an independent Gaussian N(mu, softplus(rho)^2).
 
-    重参数化:
+    Reparameterization:
         sigma = softplus(rho) * sigma_scale
         W     = mu + sigma * epsilon,   epsilon ~ N(0, I)
         b     = mu_b + softplus(rho_b) * epsilon_b
 
-    先验: p(W) = N(0, prior_std^2)
-    后验: q(W) = N(mu, softplus(rho)^2)
+    Prior: p(W) = N(0, prior_std^2)
+    Posterior: q(W) = N(mu, softplus(rho)^2)
 
-    sigma_scale 是应力放大系数，等于用户配置的 sigma_thresh。
+    sigma_scale is the stress scaling factor, equal to the user-configured sigma_thresh.
     """
 
     def __init__(
@@ -85,7 +85,7 @@ class BayesianLinear(nn.Module):
         self._reset_parameters(rho_init_mean)
 
     def _reset_parameters(self, rho_init_mean: float) -> None:
-        """Kaiming 初始化 mu，rho 初始化为小值使初始 std ≈ 0.1"""
+        """Kaiming init for mu; rho initialized to small values so initial std ≈ 0.1"""
         nn.init.kaiming_uniform_(self.mu_w, a=math.sqrt(5))
         nn.init.constant_(self.rho_w, rho_init_mean)
 
@@ -96,7 +96,7 @@ class BayesianLinear(nn.Module):
             nn.init.constant_(self.rho_b, rho_init_mean)
 
     def forward(self, x: torch.Tensor, sigma_scale: float = 1.0) -> torch.Tensor:
-        """采样权重 → 线性变换"""
+        """Sample weights → linear transformation"""
         sigma_w = F.softplus(self.rho_w) * sigma_scale
         weight = self.mu_w + sigma_w * torch.randn_like(sigma_w)
 
@@ -109,7 +109,7 @@ class BayesianLinear(nn.Module):
         return F.linear(x, weight, bias)
 
     def kl_divergence(self) -> torch.Tensor:
-        """KL(q||p) 闭式解"""
+        """Closed-form KL(q||p) divergence"""
         sigma = F.softplus(self.rho_w)
         var = sigma * sigma
         mu_sq = self.mu_w * self.mu_w
@@ -131,23 +131,23 @@ class BayesianLinear(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 层级化基因嵌入 (Family + Allele 两级结构)
+# Hierarchical gene embedding (Family + Allele two-level structure)
 # ═══════════════════════════════════════════════════════════════
 
 
 class GeneEmbedding(nn.Module):
     """
-    层级化基因嵌入: Family(共享强度) + Allele(独有偏移)
+    Hierarchical gene embedding: Family (shared strength) + Allele (unique offset)
 
-    设计动机:
-        IGHV3-23 有 30万条训练数据 → embedding 学得很好
-        IGHV7-4  只有 500条       → embedding 几乎随机
+    Design motivation:
+        IGHV3-23 has 300K training samples → embedding learns well
+        IGHV7-4  has only 500 samples     → embedding is nearly random
 
-    解决方案:
-        罕见基因: family_embed(IGHV7) + allele_offset(≈0) → 自动回退到家族表示
-        常见基因: family_embed(IGHV3) + allele_offset(独有) → 精确定位
+    Solution:
+        Rare gene:  family_embed(IGHV7) + allele_offset(≈0) → auto fallback to family representation
+        Common gene: family_embed(IGHV3) + allele_offset(unique) → precise localization
 
-    数学:
+    Mathematics:
         gene_repr = family_embed[family_idx] + allele_embed[allele_idx]
         final     = LayerNorm(gene_repr)
     """
@@ -168,7 +168,7 @@ class GeneEmbedding(nn.Module):
 
         self.norm = nn.LayerNorm(family_dim + allele_dim)
 
-        # 基因名 → (family_idx, allele_idx) 映射表
+        # Gene name → (family_idx, allele_idx) mapping
         self._gene_registry: Dict[str, int] = {}
         self._family_map: Dict[str, int] = {}
         self._next_allele_idx = 0
@@ -178,13 +178,13 @@ class GeneEmbedding(nn.Module):
 
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.family_embed.weight, mean=0.0, std=0.05)
-        # allele embedding 初始化为更小的值，让家族先验主导
+        # Initialize allele embedding with smaller values so family prior dominates
         nn.init.normal_(self.allele_embed.weight, mean=0.0, std=0.01)
 
     def register_gene(self, gene_name: str) -> int:
-        """注册基因名，返回 allele 索引"""
+        """Register a gene name and return its allele index"""
         if gene_name not in self._gene_registry:
-            # 提取家族 (如 "IGHV3-23*01" → "IGHV3")
+            # Extract family (e.g., "IGHV3-23*01" → "IGHV3")
             family = self._extract_family(gene_name)
             if family not in self._family_map:
                 self._family_map[family] = self._next_family_idx
@@ -194,18 +194,18 @@ class GeneEmbedding(nn.Module):
         return self._gene_registry[gene_name]
 
     def _extract_family(self, gene_name: str) -> str:
-        """从 IMGT 基因名提取家族: IGHV3-23*01 → IGHV3"""
-        # 去掉等位基因后缀
+        """Extract family from IMGT gene name: IGHV3-23*01 → IGHV3"""
+        # Strip allele suffix
         name = gene_name.split("*")[0] if "*" in gene_name else gene_name
         # IGHV3-23 → IGHV3, IGHD1-1 → IGHD1
         import re
         match = re.match(r"(IGH[VDJ]\d+)", name)
         if match:
             return match.group(1)
-        return name[:5]  # 降级截断
+        return name[:5]  # Degenerate truncation
 
     def get_family_index(self, gene_name: str) -> int:
-        """获取家族索引"""
+        """Get family index for a gene name"""
         family = self._extract_family(gene_name)
         if family not in self._family_map:
             self.register_gene(gene_name)
@@ -213,13 +213,13 @@ class GeneEmbedding(nn.Module):
 
     def forward(self, gene_names: List[str]) -> torch.Tensor:
         """
-        前向: 基因名列表 → (batch, family_dim + allele_dim)
+        Forward: gene name list → (batch, family_dim + allele_dim)
 
         Args:
-            gene_names: 基因名列表
+            gene_names: list of gene names
 
         Returns:
-            (batch_size, family_dim + allele_dim) 嵌入向量
+            (batch_size, family_dim + allele_dim) embedding vectors
         """
         device = self.family_embed.weight.device
         family_indices: List[int] = []
@@ -245,29 +245,29 @@ class GeneEmbedding(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 物理化学侧翼编码器 (6通道 CNN)
+# Physicochemical flank encoder (6-channel CNN)
 # ═══════════════════════════════════════════════════════════════
 
 
 class FlankPhysChemEncoder(nn.Module):
     """
-    侧翼序列的物理化学 CNN 编码器。
+    Physicochemical CNN encoder for flank sequences.
 
-    输入: 原始侧翼核苷酸字符串 (如 "TGC")
-    输出: (batch, 64) 固定维度特征向量
+    Input: raw flank nucleotide string (e.g. "TGC")
+    Output: (batch, 64) fixed-dimension feature vector
 
-    6 个通道 (替代简单的 one-hot):
-        通道 1: A 位
-        通道 2: C 位
-        通道 3: G 位
-        通道 4: T 位
-        通道 5: GC 含量 (G|C = 1, A|T = 0)
-        通道 6: 嘌呤/嘧啶 (A|G = 1, C|T = 0)
+    6 channels (instead of simple one-hot):
+        Channel 1: A presence
+        Channel 2: C presence
+        Channel 3: G presence
+        Channel 4: T presence
+        Channel 5: GC content (G|C = 1, A|T = 0)
+        Channel 6: Purine/Pyrimidine (A|G = 1, C|T = 0)
 
-    设计动机:
-        "CAG" 和 "CAA" 在物理化学上很接近(都是嘧啶-嘌呤-嘌呤)，
-        CNN 通过局部感受野自动捕获这种相似性，
-        罕见侧翼组合通过相似性泛化而非过拟合。
+    Design motivation:
+        "CAG" and "CAA" are physicochemically similar (both pyrimidine-purine-purine),
+        CNN automatically captures this similarity through local receptive fields,
+        rare flank combinations generalize via similarity rather than overfitting.
     """
 
     def __init__(self, max_flank_len: int = 15, out_dim: int = 64) -> None:
@@ -275,7 +275,7 @@ class FlankPhysChemEncoder(nn.Module):
         self.max_flank_len = max_flank_len
         self.out_dim = out_dim
 
-        # 小卷积网络: 6通道 → 32 → 64 → GlobalAvgPool
+        # Small conv net: 6 channels → 32 → 64 → GlobalAvgPool
         self.conv = nn.Sequential(
             nn.Conv1d(6, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -283,11 +283,11 @@ class FlankPhysChemEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
-        # 投影到输出维度
+        # Project to output dimension
         self.proj = nn.Linear(64, out_dim)
 
     def _seq_to_physchem(self, seq: str) -> torch.Tensor:
-        """核苷酸序列 → (6, L) 物理化学张量"""
+        """Nucleotide sequence → (6, L) physicochemical tensor"""
         chars = list(seq.upper())
         L = min(len(chars), self.max_flank_len)
         tensor = torch.zeros(6, self.max_flank_len, dtype=torch.float32)
@@ -295,32 +295,32 @@ class FlankPhysChemEncoder(nn.Module):
         for i, c in enumerate(chars[: self.max_flank_len]):
             if c == "A":
                 tensor[0, i] = 1.0
-                tensor[4, i] = 0.0  # 非GC
-                tensor[5, i] = 1.0  # 嘌呤
+                tensor[4, i] = 0.0  # non-GC
+                tensor[5, i] = 1.0  # purine
             elif c == "C":
                 tensor[1, i] = 1.0
                 tensor[4, i] = 1.0  # GC
-                tensor[5, i] = 0.0  # 嘧啶
+                tensor[5, i] = 0.0  # pyrimidine
             elif c == "G":
                 tensor[2, i] = 1.0
                 tensor[4, i] = 1.0  # GC
-                tensor[5, i] = 1.0  # 嘌呤
+                tensor[5, i] = 1.0  # purine
             elif c == "T":
                 tensor[3, i] = 1.0
-                tensor[4, i] = 0.0  # 非GC
-                tensor[5, i] = 0.0  # 嘧啶
-            else:  # N 或其他
-                tensor[:, i] = 0.25  # 均匀不确定
+                tensor[4, i] = 0.0  # non-GC
+                tensor[5, i] = 0.0  # pyrimidine
+            else:  # N or other
+                tensor[:, i] = 0.25  # uniform uncertainty
 
         return tensor
 
     def forward(self, flank_seqs: List[str]) -> torch.Tensor:
         """
         Args:
-            flank_seqs: 侧翼序列字符串列表
+            flank_seqs: list of flank sequence strings
 
         Returns:
-            (batch_size, out_dim) 物理化学特征向量
+            (batch_size, out_dim) physicochemical feature vectors
         """
         batch_size = len(flank_seqs)
         device = self.proj.weight.device
@@ -336,57 +336,57 @@ class FlankPhysChemEncoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 完整特征编码器 (整合 GeneEmbedding + FlankPhysChemEncoder)
+# Full feature encoder (integrates GeneEmbedding + FlankPhysChemEncoder)
 # ═══════════════════════════════════════════════════════════════
 
 
 class JunctionFeatureEncoder(nn.Module):
     """
-    将 (基因名, 侧翼序列, 删除长度) 编码为统一的贝叶斯网络输入。
+    Encodes (gene names, flank sequences, deletion lengths) into a unified Bayesian network input.
 
-    架构:
-        V 基因 → GeneEmbedding (family+allele) → 64d
-        D 基因 → GeneEmbedding (family+allele) → 64d
-        J 基因 → GeneEmbedding (family+allele) → 64d
-        V侧翼  → FlankPhysChemEncoder → 64d
-        D5侧翼 → FlankPhysChemEncoder → 64d
-        D3侧翼 → FlankPhysChemEncoder → 64d
-        J侧翼  → FlankPhysChemEncoder → 64d
-        删除长度 → Linear(4→16) + ReLU
+    Architecture:
+        V gene  → GeneEmbedding (family+allele) → 64d
+        D gene  → GeneEmbedding (family+allele) → 64d
+        J gene  → GeneEmbedding (family+allele) → 64d
+        V flank → FlankPhysChemEncoder → 64d
+        D5 flank → FlankPhysChemEncoder → 64d
+        D3 flank → FlankPhysChemEncoder → 64d
+        J flank → FlankPhysChemEncoder → 64d
+        Deletion lengths → Linear(4→16) + ReLU
         ─────────────────────────────────
-        拼接: 64*3 + 64*4 + 16 = 464 维
-        → LayerNorm → Dropout → 输出
+        Concatenation: 64*3 + 64*4 + 16 = 464 dim
+        → LayerNorm → Dropout → output
 
-    v3.1 新增消融开关:
-        use_gene_embedding=False → 基因嵌入替换为简单零向量
-        use_flank_cnn=False       → 侧翼特征替换为零向量
+    v3.1 ablation switches:
+        use_gene_embedding=False → gene embeddings replaced with zero vectors
+        use_flank_cnn=False       → flank features replaced with zero vectors
     """
 
     def __init__(
         self,
-        # ── 基因级别参数 (旧 API: 按类型数量分配) ──
+        # ── Gene-level parameters (legacy API: allocate by type count) ──
         v_families: int = 7,
-        v_alleles: int = 280,   # v5: 增大默认值覆盖所有IMGT等位基因
+        v_alleles: int = 280,   # v5: increased default to cover all IMGT alleles
         d_families: int = 8,
         d_alleles: int = 50,
         j_families: int = 6,
         j_alleles: int = 15,
-        gene_dim: int = 32,        # family + allele 各 32 = 64 维
-        # ── 侧翼参数 ──
+        gene_dim: int = 32,        # family + allele each 32 = 64 dim
+        # ── Flank parameters ──
         flank_out_dim: int = 64,
-        flank_len: int = 15,       # FlankPhysChemEncoder 最大侧翼长度
+        flank_len: int = 15,       # FlankPhysChemEncoder max flank length
         dropout_p: float = 0.1,
-        # ── 消融开关 (v3.1) ──
+        # ── Ablation switches (v3.1) ──
         use_gene_embedding: bool = True,
         use_flank_cnn: bool = True,
-        # ── 新 API: 直接传基因列表自动推断参数 ──
+        # ── New API: pass gene lists to auto-infer parameters ──
         v_genes: list | None = None,
         d_genes: list | None = None,
         j_genes: list | None = None,
     ) -> None:
         super().__init__()
 
-        # 支持新 API: 传基因列表自动推断 family/allele 数量
+        # Support new API: pass gene list to auto-infer family/allele counts
         if v_genes is not None:
             v_families, v_alleles = self._infer_gene_counts(v_genes)
         if d_genes is not None:
@@ -397,19 +397,19 @@ class JunctionFeatureEncoder(nn.Module):
         self._use_gene_embedding = use_gene_embedding
         self._use_flank_cnn = use_flank_cnn
 
-        # 三个独立的基因嵌入器
+        # Three independent gene embedders
         self.gene_out_dim = gene_dim * 2  # family + allele
         if use_gene_embedding:
             self.v_embed = GeneEmbedding(v_families, v_alleles, gene_dim, gene_dim)
             self.d_embed = GeneEmbedding(d_families, d_alleles, gene_dim, gene_dim)
             self.j_embed = GeneEmbedding(j_families, j_alleles, gene_dim, gene_dim)
         else:
-            # 占位: 嵌入器为 None，forward 时用零向量
+            # Placeholder: embedders are None, forward uses zero vectors
             self.v_embed = None
             self.d_embed = None
             self.j_embed = None
 
-        # 一个共享的侧翼编码器 (核苷酸化学是通用的)
+        # One shared flank encoder (nucleotide chemistry is universal)
         if use_flank_cnn:
             self.flank_encoder = FlankPhysChemEncoder(max_flank_len=flank_len, out_dim=flank_out_dim)
         else:
@@ -417,16 +417,16 @@ class JunctionFeatureEncoder(nn.Module):
 
         self.flank_out_dim = flank_out_dim
 
-        # 删除长度编码
+        # Deletion length encoder
         self.del_encoder = nn.Sequential(
             nn.Linear(4, 16),
             nn.ReLU(inplace=True),
         )
 
         total_dim = (
-            self.gene_out_dim * 3   # V, D, J 基因
-            + flank_out_dim * 4     # V, D5, D3, J 侧翼
-            + 16                    # 删除长度
+            self.gene_out_dim * 3   # V, D, J genes
+            + flank_out_dim * 4     # V, D5, D3, J flanks
+            + 16                    # deletion lengths
         )
 
         self.total_dim = total_dim
@@ -435,12 +435,12 @@ class JunctionFeatureEncoder(nn.Module):
 
     @property
     def output_dim(self) -> int:
-        """便捷属性: 与 total_dim 同义，供消融实验脚本使用"""
+        """Convenience property: same as total_dim, for ablation experiment scripts"""
         return self.total_dim
 
     @staticmethod
     def _infer_gene_counts(gene_list: list) -> tuple:
-        """从基因列表推断 family 和 allele 数量"""
+        """Infer family and allele counts from a gene list"""
         import re
         families = set()
         alleles = set(gene_list)
@@ -462,11 +462,11 @@ class JunctionFeatureEncoder(nn.Module):
         j_flanks: List[str],
         deletions: torch.Tensor,  # (batch, 4): [v3_del, d5_del, d3_del, j5_del]
     ) -> torch.Tensor:
-        """编码 V/D/J 基因 + 侧翼 + 删除 → (batch, total_dim)"""
+        """Encode V/D/J genes + flanks + deletions → (batch, total_dim)"""
         bs = len(v_genes)
         device = self.del_encoder[0].weight.device
 
-        # ── 基因嵌入 (支持消融: use_gene_embedding=False → 零向量) ──
+        # ── Gene embeddings (ablation: use_gene_embedding=False → zero vectors) ──
         if self._use_gene_embedding and self.v_embed is not None:
             v_feat = self.v_embed(v_genes)
             d_feat = self.d_embed(d_genes)
@@ -476,7 +476,7 @@ class JunctionFeatureEncoder(nn.Module):
             d_feat = torch.zeros(bs, self.gene_out_dim, device=device)
             j_feat = torch.zeros(bs, self.gene_out_dim, device=device)
 
-        # ── 侧翼编码 (支持消融: use_flank_cnn=False → 零向量) ──
+        # ── Flank encoding (ablation: use_flank_cnn=False → zero vectors) ──
         if self._use_flank_cnn and self.flank_encoder is not None:
             v_flank_feat = self.flank_encoder(v_flanks)
             d5_flank_feat = self.flank_encoder(d5_flanks)
@@ -488,13 +488,13 @@ class JunctionFeatureEncoder(nn.Module):
             d3_flank_feat = torch.zeros(bs, self.flank_out_dim, device=device)
             j_flank_feat = torch.zeros(bs, self.flank_out_dim, device=device)
 
-        # ── 删除长度编码 ──
+        # ── Deletion length encoding ──
         del_max = deletions.float().max(dim=0).values
         del_max = torch.clamp(del_max, min=1.0)
         del_norm = deletions.float() / del_max.unsqueeze(0)
         del_feat = self.del_encoder(del_norm)
 
-        # ── 拼接 + 归一化 ──
+        # ── Concatenation + normalization ──
         combined = torch.cat(
             [
                 v_feat, d_feat, j_feat,
@@ -507,27 +507,27 @@ class JunctionFeatureEncoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 升级版贝叶斯连接区生成网络
+# Upgraded Bayesian junction generation network
 # ═══════════════════════════════════════════════════════════════
 
 
 class BayesianJunctionNet(nn.Module):
     """
-    贝叶斯连接区生成网络
+    Bayesian junction generation network
 
-    架构升级:
-        - 3 层扩张 MLP (512 → 512 → 256) 替代 2 层收缩结构
-        - N1 和 N2 独立双头 (各自 Bayesian 输出层)
-        - LayerNorm + GELU 替代简单 ReLU, 提高训练稳定性
-        - Residual 连接防止深度退化
+    Architecture upgrade:
+        - 3-layer expanding MLP (512 → 512 → 256) replaces 2-layer shrinking structure
+        - N1 and N2 independent dual heads (each with Bayesian output layer)
+        - LayerNorm + GELU replaces simple ReLU, improving training stability
+        - Residual connections prevent deep degradation
 
-    sigma_thresh 直接放大所有权重的采样噪声。
+    sigma_thresh directly amplifies the sampling noise of all weights.
 
-    参数量: ~850K (800K+ MLP, 50K 编码器)
-    显存: ~400MB (训练), ~50MB (推理)
-    预期效果:
-        σ=1.0: N区分布与 OAS 真实数据 KL < 0.03 bits/base
-        σ=1.5: 罕见插入涌现, 压测第三方工具
+    Parameters: ~850K (800K+ MLP, 50K encoder)
+    Memory: ~400MB (training), ~50MB (inference)
+    Expected performance:
+        σ=1.0: N-region distribution vs OAS real data KL < 0.03 bits/base
+        σ=1.5: Rare insertions emerge, stress-testing third-party tools
     """
 
     NUCLEOTIDES = ["A", "C", "G", "T"]
@@ -541,11 +541,11 @@ class BayesianJunctionNet(nn.Module):
         max_junction_len: int = 30,
         dropout_p: float = 0.15,
         prior_std: float = 1.0,
-        # ── 别名 (兼容消融脚本) ──
+        # ── Aliases (compatible with ablation scripts) ──
         hidden_dim: int | None = None,
         max_len: int | None = None,
     ) -> None:
-        # 别名解析
+        # Alias resolution
         if hidden_dim is not None:
             hidden_dim_1 = hidden_dim_2 = hidden_dim
         if max_len is not None:
@@ -556,17 +556,17 @@ class BayesianJunctionNet(nn.Module):
         self.max_junction_len = max_junction_len
         self.num_nucleotides = len(self.NUCLEOTIDES)
 
-        # ── 贝叶斯 MLP 骨架 (3层扩张, 带残差结构) ──
+        # ── Bayesian MLP backbone (3-layer expanding, with residual structure) ──
         self.blinear1 = BayesianLinear(input_dim, hidden_dim_1, prior_std=prior_std)
         self.blinear2 = BayesianLinear(hidden_dim_1, hidden_dim_2, prior_std=prior_std)
         self.blinear3 = BayesianLinear(hidden_dim_2, latent_dim, prior_std=prior_std)
 
-        # LayerNorm 用于稳定训练
+        # LayerNorm for training stability
         self.norm1 = nn.LayerNorm(hidden_dim_1)
         self.norm2 = nn.LayerNorm(hidden_dim_2)
         self.norm3 = nn.LayerNorm(latent_dim)
 
-        # ── N1 独立头 (V-D 连接区) ──
+        # ── N1 independent head (V-D junction) ──
         self.n1_length_head = BayesianLinear(
             latent_dim, max_junction_len + 1, prior_std=prior_std
         )
@@ -574,7 +574,7 @@ class BayesianJunctionNet(nn.Module):
             latent_dim, max_junction_len * self.num_nucleotides, prior_std=prior_std
         )
 
-        # ── N2 独立头 (D-J 连接区) ──
+        # ── N2 independent head (D-J junction) ──
         self.n2_length_head = BayesianLinear(
             latent_dim, max_junction_len + 1, prior_std=prior_std
         )
@@ -584,14 +584,14 @@ class BayesianJunctionNet(nn.Module):
 
         self.dropout = nn.Dropout(dropout_p)
 
-        # ── v5: 局部碱基上下文嵌入 (3阶 Markov 矫正) ──
-        self.n1_local_bias = nn.Embedding(64, self.num_nucleotides)  # 4³=64 contexts
+        # ── v5: Local base context embedding (3rd-order Markov correction) ──
+        self.n1_local_bias = nn.Embedding(64, self.num_nucleotides)  # 4³=64 contexts (4^3)
         self.n2_local_bias = nn.Embedding(64, self.num_nucleotides)
         nn.init.zeros_(self.n1_local_bias.weight)
         nn.init.zeros_(self.n2_local_bias.weight)
         self._use_local_context = True
 
-        # 收集所有贝叶斯层以便统一管理
+        # Collect all Bayesian layers for unified management
         self._all_bayesian_layers: List[BayesianLinear] = [
             self.blinear1, self.blinear2, self.blinear3,
             self.n1_length_head, self.n1_seq_head,
@@ -606,24 +606,24 @@ class BayesianJunctionNet(nn.Module):
         n2_local_idx: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        前向传播: 特征 → 潜在表示 → N1/N2 预测。
+        Forward: features → latent → N1/N2 predictions.
 
         Args:
             features: (batch, input_dim)
-            sigma_thresh: 应力放大系数
-            n1_local_idx: (batch, max_len) 前2碱基的16-class索引, None=不用局部bias
-            n2_local_idx: 同上用于N2
+            sigma_thresh: stress scaling factor
+            n1_local_idx: (batch, max_len) 2-base preceding context 16-class index, None=no local bias
+            n2_local_idx: same for N2
 
         Returns:
             n1_length_logits: (batch, max_junction_len + 1)
             n1_seq_logits:    (batch, max_junction_len, 4)
             n2_length_logits: (batch, max_junction_len + 1)
             n2_seq_logits:    (batch, max_junction_len, 4)
-            kl_total:         标量
+            kl_total:         scalar
         """
         sigma = sigma_thresh
 
-        # 骨架前向 (与之前相同)
+        # Backbone forward (same as before)
         h = F.gelu(self.norm1(self.blinear1(features, sigma_scale=sigma)))
         h = self.dropout(h)
         h = F.gelu(self.norm2(self.blinear2(h, sigma_scale=sigma)))
@@ -631,33 +631,33 @@ class BayesianJunctionNet(nn.Module):
         h = F.gelu(self.norm3(self.blinear3(h, sigma_scale=sigma)))
         h = self.dropout(h)
 
-        # N1 双头
+        # N1 dual head
         n1_len_logits = self.n1_length_head(h, sigma_scale=sigma)
         n1_seq_flat = self.n1_seq_head(h, sigma_scale=sigma)
         n1_seq_logits = n1_seq_flat.view(-1, self.max_junction_len, self.num_nucleotides)
 
-        # N2 双头
+        # N2 dual head
         n2_len_logits = self.n2_length_head(h, sigma_scale=sigma)
         n2_seq_flat = self.n2_seq_head(h, sigma_scale=sigma)
         n2_seq_logits = n2_seq_flat.view(-1, self.max_junction_len, self.num_nucleotides)
 
-        # v5: 局部碱基 context bias — 前2个碱基影响当前位置预测
+        # v5: Local base context bias — preceding 2 bases influence current position prediction
         if n1_local_idx is not None and self._use_local_context:
             # (batch, max_len, 4) + (batch, max_len, 4) broadcast
             local_bias = self.n1_local_bias(n1_local_idx)  # (batch, max_len, 4)
-            n1_seq_logits = n1_seq_logits + local_bias * 0.1  # 小权重, 微调
+            n1_seq_logits = n1_seq_logits + local_bias * 0.1  # small weight, fine-tuning
         if n2_local_idx is not None and self._use_local_context:
             local_bias = self.n2_local_bias(n2_local_idx)
             n2_seq_logits = n2_seq_logits + local_bias * 0.1
 
-        # 温度缩放
+        # Temperature scaling
         sigma_safe = max(sigma, 0.1)
         n1_len_logits = n1_len_logits / sigma_safe
         n1_seq_logits = n1_seq_logits / sigma_safe
         n2_len_logits = n2_len_logits / sigma_safe
         n2_seq_logits = n2_seq_logits / sigma_safe
 
-        # KL 总和
+        # KL total sum
         kl_total = sum(layer.kl_divergence() for layer in self._all_bayesian_layers)
 
         return n1_len_logits, n1_seq_logits, n2_len_logits, n2_seq_logits, kl_total
@@ -668,7 +668,7 @@ class BayesianJunctionNet(nn.Module):
         seq_logits: torch.Tensor,
     ) -> Tuple[List[str], List[int], torch.Tensor]:
         """
-        从 length_logits + seq_logits 采样单个连接区 (N1 或 N2)。
+        Sample a single junction (N1 or N2) from length_logits + seq_logits.
 
         Args:
             length_logits: (batch, max_junction_len + 1)
@@ -679,12 +679,12 @@ class BayesianJunctionNet(nn.Module):
         """
         batch_size = length_logits.size(0)
 
-        # 长度采样
+        # Sample length
         len_dist = torch.distributions.Categorical(logits=length_logits)
         lengths = len_dist.sample()
         len_log_probs = len_dist.log_prob(lengths)
 
-        # 逐位置碱基采样
+        # Per-position base sampling
         seqs: List[str] = []
         lens: List[int] = []
         seq_log_probs = torch.zeros(batch_size, device=length_logits.device)
@@ -715,11 +715,11 @@ class BayesianJunctionNet(nn.Module):
         sigma_thresh: float = 1.0,
     ) -> Tuple[List[str], List[int], List[str], List[int], List[float]]:
         """
-        同时采样 N1 和 N2 连接区。
+        Sample N1 and N2 junctions simultaneously.
 
         Args:
-            features: (batch, input_dim) 编码特征
-            sigma_thresh: 应力放大系数
+            features: (batch, input_dim) encoded features
+            sigma_thresh: stress scaling factor
 
         Returns:
             n1_seqs, n1_lens, n2_seqs, n2_lens, joint_log_probs (log P(N1)+log P(N2))
@@ -738,7 +738,7 @@ class BayesianJunctionNet(nn.Module):
         return n1_seqs, n1_lens, n2_seqs, n2_lens, joint_log_probs
 
     def total_kl_divergence(self) -> torch.Tensor:
-        """所有贝叶斯层的 KL 总和"""
+        """Sum of KL divergences across all Bayesian layers"""
         return sum(layer.kl_divergence() for layer in self._all_bayesian_layers)
 
     @torch.no_grad()
@@ -749,11 +749,11 @@ class BayesianJunctionNet(nn.Module):
         n2_seqs: List[str],
         sigma_thresh: float = 1.0,
     ) -> List[float]:
-        """对给定 N1/N2 序列打分，使用局部碱基 context 增强。"""
+        """Score given N1/N2 sequences using local base context enhancement."""
         batch_size = features.size(0)
         nuc_to_idx = {"A": 0, "C": 1, "G": 2, "T": 3}
 
-        # 构建每位置的 local context index (前2个碱基 → 0-15)
+        # Build per-position local context index (preceding 2 bases → 0-15)
         def _build_local_idx(seqs, max_len):
             idx = torch.zeros(batch_size, max_len, dtype=torch.long, device=features.device)
             for i, s in enumerate(seqs):
@@ -813,15 +813,15 @@ class BayesianJunctionNet(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 便捷接口: 编码+生成一步完成
+# Convenience interface: encode + generate in one step
 # ═══════════════════════════════════════════════════════════════
 
 
 class BayesAIRRGenerator:
     """
-    一站式生成器: 整合编码器 + BNN, 输入原始生物学信息直接输出 N1/N2。
+    One-stop generator: integrates encoder + BNN, takes raw biological inputs and directly outputs N1/N2.
 
-    用法:
+    Usage:
         generator = BayesAIRRGenerator(device="cuda")
         n1, n1_len, n2, n2_len, log_p = generator.generate(
             v_genes=["IGHV3-23*01"],
@@ -875,14 +875,14 @@ class BayesAIRRGenerator:
         seeds: List[int] | None = None,
     ) -> Tuple[List[str], List[int], List[str], List[int], List[float]]:
         """
-        一步生成: 原始信息 → 编码 → BNN采样 → N1/N2 序列。
+        One-step generation: raw inputs → encode → BNN sample → N1/N2 sequences.
 
         Args:
-            v_genes, d_genes, j_genes: 基因名列表
-            v_flanks, d5_flanks, d3_flanks, j_flanks: 侧翼序列
+            v_genes, d_genes, j_genes: list of gene names
+            v_flanks, d5_flanks, d3_flanks, j_flanks: flank sequences
             deletions: (batch, 4) [v3_del, d5_del, d3_del, j5_del]
-            sigma_thresh: 应力放大系数
-            seeds: 可选 per-read 随机种子；提供时逐条绑定 PyTorch RNG（与 SHM 一致）
+            sigma_thresh: stress scaling factor
+            seeds: optional per-read random seeds; when provided, binds PyTorch RNG per read (consistent with SHM)
 
         Returns:
             n1_seqs, n1_lens, n2_seqs, n2_lens, joint_log_probs
@@ -947,9 +947,9 @@ class BayesAIRRGenerator:
         n2_seqs: List[str],
         sigma_thresh: float = 1.0,
     ) -> List[float]:
-        """对真实 N1/N2 序列打分：返回每条序列的 log P(N1,N2 | V,D,J,del,flank)。
+        """Score real N1/N2 sequences: returns log P(N1,N2 | V,D,J,del,flank) per sequence.
 
-        用于 NLL 评估：与 Markov 基线的 compute_nll(true_seqs) 同口径对比。
+        Used for NLL evaluation: comparable with Markov baseline compute_nll(true_seqs).
         """
         features = self.encoder(
             v_genes=v_genes, d_genes=d_genes, j_genes=j_genes,
@@ -961,7 +961,7 @@ class BayesAIRRGenerator:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 保存/加载工具
+# Save / Load utilities
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -971,20 +971,20 @@ def save_checkpoint(
     hp_or_file_path: "HyperParams | str | Path | None" = None,
     file_path_legacy: str | Path | None = None,
 ) -> None:
-    """保存完整检查点 (模型+编码器+基因注册表)
+    """Save full checkpoint (model + encoder + gene registry)
 
-    支持两种调用方式（向后兼容消融实验脚本）：
-      - 新 API: save_checkpoint(generator, file_path)
-      - 旧 API: save_checkpoint(encoder, bnn, hp, file_path)
+    Supports two calling conventions (backward-compatible with ablation experiment scripts):
+      - New API: save_checkpoint(generator, file_path)
+      - Legacy API: save_checkpoint(encoder, bnn, hp, file_path)
     """
-    # ── 判断调用方式 ──
+    # ── Determine calling convention ──
     from bayes_airr.models.trainer import HyperParams as _HP
     if isinstance(generator_or_encoder, BayesAIRRGenerator):
-        # 新 API: save_checkpoint(generator, file_path)
+        # New API: save_checkpoint(generator, file_path)
         generator = generator_or_encoder
         file_path = Path(file_or_bnn)  # type: ignore
     else:
-        # 旧 API: save_checkpoint(encoder, bnn, hp, file_path)
+        # Legacy API: save_checkpoint(encoder, bnn, hp, file_path)
         encoder = generator_or_encoder
         bnn = file_or_bnn
         file_path = Path(file_path_legacy)  # type: ignore
@@ -998,7 +998,7 @@ def save_checkpoint(
         "bnn_state_dict": generator.bnn.state_dict(),
     }
 
-    # 基因注册表 (支持 use_gene_embedding=False 的情况)
+    # Gene registry (handles use_gene_embedding=False case)
     if generator.encoder.v_embed is not None:
         checkpoint["v_gene_registry"] = generator.encoder.v_embed._gene_registry
         checkpoint["d_gene_registry"] = generator.encoder.d_embed._gene_registry
@@ -1041,17 +1041,17 @@ def load_checkpoint(
     device: str = "cuda",
     max_junction_len: int = 30,
 ) -> BayesAIRRGenerator:
-    """从检查点加载完整生成器"""
+    """Load full generator from checkpoint"""
     file_path = Path(file_path)
     checkpoint = torch.load(str(file_path), map_location="cpu", weights_only=False)
 
     device_obj = torch.device(device if torch.cuda.is_available() else "cpu")
 
-    # 重建编码器 (使用保存的维度信息，旧格式则从 state_dict 反推)
+    # Rebuild encoder (use saved dimension info; for legacy format, infer from state_dict)
     def _get_or_infer(key: str, state_key: str, default: int) -> int:
         if key in checkpoint:
             return checkpoint[key]
-        # 从 state_dict 权重形状反推
+        # Infer from state_dict weight shape
         w = checkpoint["encoder_state_dict"].get(state_key)
         if w is not None:
             return w.shape[0]
@@ -1064,7 +1064,7 @@ def load_checkpoint(
     j_fams = _get_or_infer("j_families", "j_embed.family_embed.weight", 1)
     j_alls = _get_or_infer("j_alleles", "j_embed.allele_embed.weight", 10)
 
-    # 自动检测消融状态：检查 state_dict 中是否缺少基因嵌入/侧翼 CNN 权重
+    # Auto-detect ablation status: check if gene embedding / flank CNN weights are missing from state_dict
     enc_state = checkpoint["encoder_state_dict"]
     has_gene_embed = "v_embed.family_embed.weight" in enc_state
     has_flank_cnn = "flank_encoder.conv.0.weight" in enc_state
@@ -1076,7 +1076,7 @@ def load_checkpoint(
         use_gene_embedding=has_gene_embed,
         use_flank_cnn=has_flank_cnn,
     )
-    # 基因注册表 (兼容旧 checkpoint 不含这些字段 + 消融模型 v_embed=None 的情况)
+    # Gene registry (compatible with legacy checkpoints missing these fields + ablation models with v_embed=None)
     v_reg = checkpoint.get("v_gene_registry", {})
     d_reg = checkpoint.get("d_gene_registry", {})
     j_reg = checkpoint.get("j_gene_registry", {})
@@ -1096,7 +1096,7 @@ def load_checkpoint(
     encoder.load_state_dict(checkpoint["encoder_state_dict"])
     encoder = encoder.to(device_obj)
 
-    # 重建 BNN (使用保存的维度，兼容旧格式)
+    # Rebuild BNN (use saved dimensions, compatible with legacy format)
     input_dim = checkpoint.get("input_dim", encoder.total_dim)
     bnn = BayesianJunctionNet(
         input_dim=input_dim,
@@ -1105,7 +1105,7 @@ def load_checkpoint(
         latent_dim=checkpoint.get("latent_dim", 256),
         max_junction_len=checkpoint.get("max_junction_len", max_junction_len),
     )
-    # v6: 自动匹配 checkpoint 中 local_bias embedding 的大小
+    # v6: Auto-match local_bias embedding size from checkpoint
     bnn_state = checkpoint["bnn_state_dict"]
     for key in ["n1_local_bias.weight", "n2_local_bias.weight"]:
         if key in bnn_state:
@@ -1116,7 +1116,7 @@ def load_checkpoint(
     bnn.load_state_dict(bnn_state, strict=False)
     bnn = bnn.to(device_obj)
 
-    # 组装生成器 (v3.1: 使用新构造函数)
+    # Assemble generator (v3.1: use new constructor)
     generator = BayesAIRRGenerator(encoder=encoder, bnn=bnn, device=str(device_obj))
     generator.eval()
 
