@@ -59,10 +59,12 @@ Deletions   → DeletionEncoder (Linear 4→16)
 - PyTorch ≥ 2.0
 - NumPy
 
-## Citation
-
-*Paper in preparation.*
 
 ## License
 
 See LICENSE file.
+
+
+## E-mail
+2210240103@csu.edu.cn
+
